@@ -20,7 +20,7 @@ async function runMigrate() {
   const db = drizzle(adminPool);
   await migrate(db, { migrationsFolder });
   await adminPool.end();
-  console.log('✓ Drizzle migration complete — tenants and tasks tables ready.');
+  console.log('✓ Drizzle migration complete — tenants, users, and tasks tables ready.');
 }
 
 runMigrate().catch((err) => {

@@ -1,7 +1,7 @@
 {
   "name": "ai-agent-multitenant",
   "version": "1.0.0",
-  "description": "Multi-tenant AI agent backend: Postgres RLS + MCP tools + evals",
+  "description": "Multi-tenant AI agent backend: Postgres RLS, user auth, MCP tools, evals",
   "type": "module",
   "scripts": {
     "db:generate": "drizzle-kit generate",

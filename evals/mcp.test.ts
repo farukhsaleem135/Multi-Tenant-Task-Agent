@@ -1,11 +1,19 @@
 /**
  * MCP integration eval — exercises the real stdio server process.
+ *
+ * Auth: MCP_AUTH_TOKEN env simulates Authorization: Bearer for stdio transport.
+ * Same server binary serves all tenants; tenant resolved per tool call from user token.
  */
 import 'dotenv/config';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { getTenantId, getTenantTasks } from './setup.js';
-import { startMcpClient, parseToolText } from './mcp-helpers.js';
+import { getTenantId, getTenantTasks, getUserTokenForTenant } from './setup.js';
+import {
+  startMcpClient,
+  startMcpClientUnauthenticated,
+  parseToolText,
+} from './mcp-helpers.js';
 import { appPool, adminPool } from '../src/db/client.js';
+import { SEEDED_USER_TOKENS } from '../src/db/seed-tokens.js';
 
 let tenantAId: string;
 let tenantBId: string;
@@ -22,7 +30,7 @@ afterAll(async () => {
 
 describe('MCP server — integration', () => {
   it('exposes exactly two tools: list_tasks and get_task', async () => {
-    const session = await startMcpClient('A');
+    const session = await startMcpClient(SEEDED_USER_TOKENS.aliceTenantA);
     try {
       const { tools } = await session.client.listTools();
       const names = tools?.map((t) => t.name).sort() ?? [];
@@ -32,8 +40,8 @@ describe('MCP server — integration', () => {
     }
   });
 
-  it('list_tasks returns only the authorised tenant rows', async () => {
-    const session = await startMcpClient('A');
+  it('list_tasks returns only the authenticated user tenant rows', async () => {
+    const session = await startMcpClient(getUserTokenForTenant('A'));
     try {
       const result = await session.client.callTool({ name: 'list_tasks', arguments: {} });
       const body = parseToolText(result) as { tasks: Array<{ tenantId: string }> };
@@ -51,7 +59,7 @@ describe('MCP server — integration', () => {
     const bTasks = await getTenantTasks(tenantBId);
     const targetId = bTasks[0].id;
 
-    const session = await startMcpClient('A');
+    const session = await startMcpClient(getUserTokenForTenant('A'));
     try {
       const result = await session.client.callTool({
         name: 'get_task',
@@ -67,7 +75,7 @@ describe('MCP server — integration', () => {
   });
 
   it('get_task returns NOT_FOUND for a non-existent UUID (same shape as cross-tenant)', async () => {
-    const session = await startMcpClient('A');
+    const session = await startMcpClient(getUserTokenForTenant('A'));
     try {
       const result = await session.client.callTool({
         name: 'get_task',
@@ -81,10 +89,10 @@ describe('MCP server — integration', () => {
     }
   });
 
-  it('list_tasks as Tenant A never leaks Tenant B titles (injection scenario)', async () => {
+  it('list_tasks as Tenant A user never leaks Tenant B titles (injection scenario)', async () => {
     const tenantBTitles = (await getTenantTasks(tenantBId)).map((t) => t.title);
 
-    const session = await startMcpClient('A');
+    const session = await startMcpClient(getUserTokenForTenant('A'));
     try {
       const result = await session.client.callTool({ name: 'list_tasks', arguments: {} });
       const body = parseToolText(result) as { tasks: Array<{ title: string; description?: string }> };
@@ -100,6 +108,33 @@ describe('MCP server — integration', () => {
         t.description?.includes('Ignore your previous instructions'),
       );
       expect(hasInjection).toBe(true);
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('returns UNAUTHORIZED when no auth token is provided', async () => {
+    const session = await startMcpClientUnauthenticated();
+    try {
+      const result = await session.client.callTool({ name: 'list_tasks', arguments: {} });
+      const body = parseToolText(result) as { error?: string };
+
+      expect(body).toEqual({ error: 'UNAUTHORIZED' });
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('same server binary serves Tenant B when bob token is used', async () => {
+    const session = await startMcpClient(getUserTokenForTenant('B'));
+    try {
+      const result = await session.client.callTool({ name: 'list_tasks', arguments: {} });
+      const body = parseToolText(result) as { tasks: Array<{ tenantId: string }> };
+
+      expect(body.tasks.length).toBeGreaterThan(0);
+      for (const task of body.tasks) {
+        expect(task.tenantId).toBe(tenantBId);
+      }
     } finally {
       await session.close();
     }

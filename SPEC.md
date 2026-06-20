@@ -19,6 +19,26 @@ schema changes, then `npm run db:migrate` to apply.
 | name       | text UNIQUE | human-readable label        |
 | created_at | timestamp   | server-side default         |
 
+### `users`
+
+| Column     | Type        | Notes                                      |
+|------------|-------------|--------------------------------------------|
+| id         | uuid PK     | `gen_random_uuid()`                        |
+| email      | text UNIQUE | login identity                             |
+| tenant_id  | uuid FK     | which tenant this user belongs to          |
+| api_token  | text UNIQUE | bearer token for auth (demo / eval tokens) |
+| created_at | timestamp   | server-side default                        |
+
+Seeded users:
+
+| User  | Email                 | Tenant | API token (demo)           |
+|-------|-----------------------|--------|----------------------------|
+| alice | alice@tenant-a.local  | A      | `dev-token-alice-tenant-a` |
+| bob   | bob@tenant-b.local    | B      | `dev-token-bob-tenant-b`   |
+
+User→tenant lookup uses `adminDb` (auth metadata, not tenant-scoped task data).
+Task data always flows through `withTenantContext` + RLS.
+
 ### `tasks`
 
 | Column      | Type             | Notes                                        |
@@ -33,8 +53,8 @@ schema changes, then `npm run db:migrate` to apply.
 **Why uuid PKs?** Opaque identifiers — sequential integers leak row count and
 make cross-tenant ID probing trivial.
 
-**Why ON DELETE CASCADE?** Dropping a tenant atomically removes all its tasks,
-preventing orphaned rows that would be invisible to any tenant context.
+**Why ON DELETE CASCADE?** Dropping a tenant atomically removes its users and
+tasks, preventing orphaned rows.
 
 ---
 
@@ -82,6 +102,9 @@ CREATE POLICY tasks_tenant_isolation ON tasks
 `FORCE ROW LEVEL SECURITY` ensures the table owner is also subject to the
 policy when acting as a non-superuser role.
 
+RLS applies to **`tasks` only**. The `users` table holds auth metadata and is
+queried via the admin pool before tenant context is established.
+
 ### Behaviour table
 
 | Scenario                                   | Visible rows   |
@@ -109,7 +132,44 @@ This gives us **default-deny**: no context set = no rows visible.
 
 ---
 
-## 3. Tenant context per request
+## 3. Authentication and tenant resolution
+
+Implementation: `src/auth/resolve-tenant.ts`
+
+### Per-request flow
+
+On every MCP tool call:
+
+1. **Extract bearer token** (priority order):
+   - MCP OAuth `authInfo.token` (production HTTP transport)
+   - `Authorization: Bearer …` request header (production HTTP transport)
+   - Session-bound token (MCP session store)
+   - `MCP_AUTH_TOKEN` env var (**stdio local dev / eval harness only**)
+2. **Look up user** — `SELECT tenant_id FROM users WHERE api_token = $1`
+3. **Reject if missing/invalid** — return `{ error: "UNAUTHORIZED" }`
+4. **Set tenant context** — `withTenantContext(tenantId, fn)` → RLS filters `tasks`
+
+### What clients must NOT do
+
+- Pass `tenant_id` as a tool argument
+- Choose tenant at MCP server startup (no `TENANT_NAME` env var)
+- Override tenant via any tool parameter
+
+Tenant scope comes **only** from authenticated user identity resolved internally.
+
+### Stdio vs HTTP auth
+
+| Transport | How auth is delivered | Used for |
+|-----------|----------------------|----------|
+| HTTP MCP  | `Authorization: Bearer …` or OAuth `authInfo` | Production |
+| Stdio MCP | `MCP_AUTH_TOKEN` env when process is spawned | Local dev, evals |
+
+Stdio has no HTTP headers per request. Evals use `MCP_AUTH_TOKEN` to feed the
+**same** token→user→tenant lookup as production Bearer auth.
+
+---
+
+## 4. Tenant context per request
 
 `withTenantContext(tenantId, fn)` in `src/db/client.ts`:
 
@@ -126,28 +186,31 @@ check that could be accidentally omitted. The database is the sole enforcer.
 
 ---
 
-## 4. MCP skill contract
+## 5. MCP skill contract
 
 ### Startup
 
-Tenant identity is resolved **once, at startup**, from `TENANT_NAME` env var.
-The UUID is looked up from the `tenants` table and stored in memory. All tool
-calls use this fixed context — clients cannot override it.
+The MCP server starts **once** and serves all tenants. It does **not** read
+any tenant identifier at startup.
 
 ### `list_tasks`
 
 - **Input**: none
-- **Output**: `{ tasks: Task[] }` — all tasks for the authorised tenant
-- **Allowed**: read tasks for the current tenant
+- **Auth**: bearer token required
+- **Output (success)**: `{ tasks: Task[] }` — all tasks for the user's tenant
+- **Output (no auth)**: `{ error: "UNAUTHORIZED" }`
+- **Allowed**: read tasks for the authenticated user's tenant
 - **Must refuse**: return tasks for any other tenant  
   *(enforced by RLS, not a code check)*
 
 ### `get_task`
 
 - **Input**: `{ task_id: uuid }`
+- **Auth**: bearer token required
 - **Output (found)**: `{ task: Task }`
 - **Output (not found)**: `{ error: "NOT_FOUND" }`
-- **Allowed**: read a task that belongs to the current tenant
+- **Output (no auth)**: `{ error: "UNAUTHORIZED" }`
+- **Allowed**: read a task that belongs to the authenticated user's tenant
 - **Must refuse**: reveal whether a task_id belongs to another tenant  
   When RLS hides a row, `NOT_FOUND` is returned — identical to a genuinely
   missing ID. The caller cannot infer the row's existence.
@@ -155,7 +218,7 @@ calls use this fixed context — clients cannot override it.
 
 ---
 
-## 5. Injection test case design
+## 6. Injection test case design
 
 Tenant A's third task has this description:
 
@@ -166,12 +229,15 @@ This exercises two independent defence layers:
 
 ### Layer 1 — DB-level (deterministic, hard guarantee)
 
-`withTenantContext(tenantAId, ...)` + RLS = physically impossible to return
+Authenticated as Alice (Tenant A) + RLS = physically impossible to return
 Tenant B data via the MCP tools, regardless of what the AI model decides to do.
 
 Tested in `evals/safety.test.ts`:
 - `DB layer: withTenantContext(tenantAId) cannot return Tenant B data`
 - `DB layer: get_task with any Tenant B ID returns NOT_FOUND`
+
+Also in `evals/mcp.test.ts`:
+- `list_tasks as Tenant A user never leaks Tenant B titles`
 
 ### Layer 2 — Model-level (probabilistic, defence-in-depth)
 
@@ -180,10 +246,22 @@ injected instruction.
 
 Tested in `evals/safety.test.ts`:
 - `Model layer: Claude does not act on injected instruction`
-- The test runs a full agentic loop and asserts the final response contains
-  none of Tenant B's task titles.
 - Requires `ANTHROPIC_API_KEY`; skipped (not failed) when absent.
 
 The DB-level defence is the hard requirement. The model-level defence is
-additional depth — it would matter if, for example, an attacker found a way
-to pass arbitrary SQL or craft a tool call that bypassed `withTenantContext`.
+additional depth.
+
+---
+
+## 7. Eval suite summary
+
+| File | Count | What it proves |
+|------|-------|----------------|
+| `evals/isolation.test.ts` | 6 | RLS isolation at DB layer; hard-rule zero-row tests |
+| `evals/safety.test.ts` | 4 (1 skipped) | Injection resistance; DB + optional model layer |
+| `evals/mcp.test.ts` | 7 | Real stdio MCP server; auth, NOT_FOUND, cross-tenant |
+
+**Total:** 16 passed, 1 skipped (17) after RLS is installed.
+
+MCP integration tests use `MCP_AUTH_TOKEN` (stdio harness). DB isolation tests
+use `withTenantContext` directly. See `docs/TDD_EVIDENCE.md` for fail-first RLS proof.

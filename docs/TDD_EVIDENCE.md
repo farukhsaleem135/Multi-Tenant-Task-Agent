@@ -18,7 +18,7 @@ docker compose up -d
 npm run db:migrate
 npm run db:seed
 
-# 2. Run evals — expect 2 failures
+# 2. Run evals — expect 2 failures (isolation hard-rule tests)
 npm test
 ```
 
@@ -46,14 +46,18 @@ npm run db:setup-rls
 npm test
 ```
 
-### Captured post-RLS output (2026-06-19)
+### Captured post-RLS output (2026-06-20, after user-auth refactor)
 
 ```
 Test Files  3 passed (3)
-Tests  14 passed | 1 skipped (15)
+Tests  16 passed | 1 skipped (17)
 ```
 
-All isolation, safety (DB-layer), and MCP integration tests pass.
+Breakdown:
+- 6 isolation tests (RLS at DB layer)
+- 4 safety tests (3 DB-layer + 1 model-layer skipped without `ANTHROPIC_API_KEY`)
+- 7 MCP integration tests (stdio server; user token auth; cross-tenant NOT_FOUND; UNAUTHORIZED)
+
 The model-layer Claude test is **skipped** unless `ANTHROPIC_API_KEY` is set.
 
 ## Why this matters
@@ -63,3 +67,10 @@ After RLS + `FORCE ROW LEVEL SECURITY`, the same raw query returns zero rows whe
 `app.current_tenant_id` is unset or wrong — with **no** application `WHERE tenant_id` clause.
 
 That red→green transition is the proof that isolation lives in PostgreSQL, not in TypeScript.
+
+## Auth note (MCP evals)
+
+MCP integration tests authenticate via `MCP_AUTH_TOKEN` when spawning the stdio server.
+This exercises the same `users.api_token` → `tenant_id` lookup as production
+`Authorization: Bearer …` headers. Stdio has no HTTP headers; the env var is a
+test harness only. See `SPEC.md` §3 for the full auth priority list.

@@ -1,68 +1,68 @@
 /**
- * MCP server — exposes two read-only tools for the current tenant.
+ * MCP server — exposes two read-only tools for all tenants.
  *
- * Tenant identity is resolved at startup from the TENANT_NAME env var.
- * It is NOT a per-tool parameter; clients cannot request data for a different
- * tenant by passing an argument. The server is single-tenant by design.
+ * A single server instance serves every tenant. On each tool call the server
+ * resolves the caller's tenant from authenticated user identity (bearer token),
+ * then delegates to withTenantContext() so RLS enforces row visibility.
  *
  * Tools:
- *   list_tasks  — returns all tasks for the authorised tenant
+ *   list_tasks  — returns all tasks for the authenticated user's tenant
  *   get_task    — returns one task by ID; returns NOT_FOUND if the ID does
  *                 not exist OR belongs to a different tenant (indistinguishable
  *                 at this API level — RLS makes both cases look identical)
  *
- * Isolation guarantee:
- *   Both tools delegate to withTenantContext(), which sets
- *   app.current_tenant_id as a transaction-local variable. The RLS policy
- *   on `tasks` then filters rows. No WHERE clause in application code is
- *   trusted or needed — the database is the sole enforcer.
+ * Tenant identity is NEVER taken from tool arguments — only from auth context.
  */
 import 'dotenv/config';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
+import type { ServerRequest, ServerNotification } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { eq } from 'drizzle-orm';
-import { adminDb, withTenantContext } from '../db/client.js';
-import { tenants, tasks } from '../db/schema.js';
+import { withTenantContext } from '../db/client.js';
+import { tasks } from '../db/schema.js';
+import { resolveTenantFromRequest } from '../auth/resolve-tenant.js';
 
-async function resolveTenantId(): Promise<string> {
-  const name = process.env.TENANT_NAME;
-  if (!name) throw new Error('TENANT_NAME env var is required (e.g. "A" or "B")');
+type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
-  const rows = await adminDb
-    .select({ id: tenants.id })
-    .from(tenants)
-    .where(eq(tenants.name, name));
+function unauthorizedResult() {
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify({ error: 'UNAUTHORIZED' }) }],
+    isError: true,
+  };
+}
 
-  if (!rows[0]) {
-    throw new Error(`Tenant "${name}" not found — run "npm run db:seed" first`);
-  }
-  return rows[0].id;
+function internalErrorResult() {
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INTERNAL_ERROR' }) }],
+    isError: true,
+  };
 }
 
 async function main() {
-  const tenantId = await resolveTenantId();
-  console.error(
-    `MCP task-manager starting for tenant "${process.env.TENANT_NAME}" (${tenantId})`,
-  );
+  console.error('MCP task-manager starting (multi-tenant — auth resolves tenant per request).');
 
   const server = new McpServer({
     name: 'task-manager',
     version: '1.0.0',
   });
 
-  // ── list_tasks ─────────────────────────────────────────────────────────────
-  // v1 McpServer API: server.tool(name, description, inputShape, handler)
   server.tool(
     'list_tasks',
-    'List all tasks for the current tenant. ' +
-      'Returns only tasks belonging to the authenticated tenant. ' +
+    'List all tasks for the authenticated user\'s tenant. ' +
+      'Returns only tasks belonging to the tenant linked to the caller. ' +
       'Isolation is enforced by database-level Row-Level Security, ' +
       'not by application-layer filtering.',
     {},
-    async () => {
+    async (_args, extra: ToolExtra) => {
       try {
-        const rows = await withTenantContext(tenantId, (db) =>
+        const resolution = await resolveTenantFromRequest(extra);
+        if (!resolution.ok) {
+          return unauthorizedResult();
+        }
+
+        const rows = await withTenantContext(resolution.tenantId, (db) =>
           db.select().from(tasks),
         );
         return {
@@ -71,24 +71,25 @@ async function main() {
           ],
         };
       } catch {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ error: 'INTERNAL_ERROR' }) }],
-          isError: true,
-        };
+        return internalErrorResult();
       }
     },
   );
 
-  // ── get_task ───────────────────────────────────────────────────────────────
   server.tool(
     'get_task',
-    'Get a single task by ID for the current tenant. ' +
+    'Get a single task by ID for the authenticated user\'s tenant. ' +
       'Returns NOT_FOUND if the task does not exist or is owned by another tenant. ' +
       'The caller cannot distinguish between the two cases.',
     { task_id: z.string().uuid('task_id must be a valid UUID') },
-    async ({ task_id }) => {
+    async ({ task_id }, extra: ToolExtra) => {
       try {
-        const rows = await withTenantContext(tenantId, (db) =>
+        const resolution = await resolveTenantFromRequest(extra);
+        if (!resolution.ok) {
+          return unauthorizedResult();
+        }
+
+        const rows = await withTenantContext(resolution.tenantId, (db) =>
           db.select().from(tasks).where(eq(tasks.id, task_id)),
         );
 
@@ -106,12 +107,7 @@ async function main() {
           ],
         };
       } catch {
-        return {
-          content: [
-            { type: 'text', text: JSON.stringify({ error: 'INTERNAL_ERROR' }) },
-          ],
-          isError: true,
-        };
+        return internalErrorResult();
       }
     },
   );

@@ -9,13 +9,15 @@
  */
 import 'dotenv/config';
 import { adminDb, adminPool } from './client.js';
-import { tenants, tasks } from './schema.js';
+import { tenants, tasks, users } from './schema.js';
+import { SEEDED_USER_TOKENS } from './seed-tokens.js';
 
 async function seed() {
   console.log('Seeding database...');
 
-  // Clean slate — FK order: tasks before tenants
+  // Clean slate — FK order: tasks → users → tenants
   await adminDb.delete(tasks);
+  await adminDb.delete(users);
   await adminDb.delete(tenants);
 
   const [tenantA, tenantB] = await adminDb
@@ -25,6 +27,25 @@ async function seed() {
 
   console.log(`  Tenant A id: ${tenantA.id}`);
   console.log(`  Tenant B id: ${tenantB.id}`);
+
+  const [userAlice, userBob] = await adminDb
+    .insert(users)
+    .values([
+      {
+        email: 'alice@tenant-a.local',
+        tenantId: tenantA.id,
+        apiToken: SEEDED_USER_TOKENS.aliceTenantA,
+      },
+      {
+        email: 'bob@tenant-b.local',
+        tenantId: tenantB.id,
+        apiToken: SEEDED_USER_TOKENS.bobTenantB,
+      },
+    ])
+    .returning();
+
+  console.log(`  User alice (${userAlice.email}) → Tenant A`);
+  console.log(`  User bob (${userBob.email}) → Tenant B`);
 
   // ── Tenant A tasks ────────────────────────────────────────────────────────
   await adminDb.insert(tasks).values([
@@ -78,6 +99,7 @@ async function seed() {
 
   console.log('  ✓ 3 tasks seeded for Tenant A (includes injection test case).');
   console.log('  ✓ 3 tasks seeded for Tenant B.');
+  console.log('  ✓ 2 users seeded (alice → A, bob → B).');
   console.log('Seeding complete.');
 
   await adminPool.end();

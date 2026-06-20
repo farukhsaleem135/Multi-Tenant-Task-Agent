@@ -26,6 +26,7 @@ async function setupRls() {
     // Grant table DML to app_user
     // (docker/init.sql sets DEFAULT PRIVILEGES for future tables; belt-and-suspenders for existing ones)
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON tenants TO app_user`);
+    await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON users   TO app_user`);
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON tasks   TO app_user`);
     await client.query(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user`);
 

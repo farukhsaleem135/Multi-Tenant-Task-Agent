@@ -8,6 +8,16 @@ export const tenants = pgTable('tenants', {
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
 
+export const users = pgTable('users', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  email: text('email').notNull().unique(),
+  tenantId: uuid('tenant_id')
+    .notNull()
+    .references(() => tenants.id, { onDelete: 'cascade' }),
+  apiToken: text('api_token').notNull().unique(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
 export const tasks = pgTable('tasks', {
   id: uuid('id').primaryKey().defaultRandom(),
   tenantId: uuid('tenant_id')
@@ -20,5 +30,6 @@ export const tasks = pgTable('tasks', {
 });
 
 export type Tenant = typeof tenants.$inferSelect;
+export type User = typeof users.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type NewTask = typeof tasks.$inferInsert;

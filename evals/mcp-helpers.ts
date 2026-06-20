@@ -1,5 +1,9 @@
 /**
  * Helpers for MCP integration tests — spawns the real stdio server process.
+ *
+ * Auth is passed via MCP_AUTH_TOKEN env, which simulates Authorization: Bearer
+ * for stdio transport (no HTTP headers). The same server binary serves all
+ * tenants; tenant is resolved per tool call from the user token.
  */
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,14 +21,40 @@ export type McpSession = {
   close: () => Promise<void>;
 };
 
-export async function startMcpClient(tenantName: string): Promise<McpSession> {
+export async function startMcpClient(authToken: string): Promise<McpSession> {
+  const env = { ...process.env };
+  env.MCP_AUTH_TOKEN = authToken;
+  delete env.TENANT_NAME;
+
   const transport = new StdioClientTransport({
     command: process.platform === 'win32' ? 'npx.cmd' : 'npx',
     args: ['tsx', path.join(projectRoot, 'src/mcp/server.ts')],
-    env: {
-      ...process.env,
-      TENANT_NAME: tenantName,
+    env,
+    cwd: projectRoot,
+    stderr: 'pipe',
+  });
+
+  const client = new Client({ name: 'eval-client', version: '1.0.0' });
+  await client.connect(transport);
+
+  return {
+    client,
+    transport,
+    close: async () => {
+      await transport.close();
     },
+  };
+}
+
+export async function startMcpClientUnauthenticated(): Promise<McpSession> {
+  const env = { ...process.env };
+  delete env.MCP_AUTH_TOKEN;
+  delete env.TENANT_NAME;
+
+  const transport = new StdioClientTransport({
+    command: process.platform === 'win32' ? 'npx.cmd' : 'npx',
+    args: ['tsx', path.join(projectRoot, 'src/mcp/server.ts')],
+    env,
     cwd: projectRoot,
     stderr: 'pipe',
   });
