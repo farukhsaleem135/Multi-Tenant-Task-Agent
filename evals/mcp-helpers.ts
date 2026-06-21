@@ -48,7 +48,8 @@ export async function startMcpClient(authToken: string): Promise<McpSession> {
 
 export async function startMcpClientUnauthenticated(): Promise<McpSession> {
   const env = { ...process.env };
-  delete env.MCP_AUTH_TOKEN;
+  // Explicit empty string prevents dotenv from loading MCP_AUTH_TOKEN from .env
+  env.MCP_AUTH_TOKEN = '';
   delete env.TENANT_NAME;
 
   const transport = new StdioClientTransport({

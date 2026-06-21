@@ -55,8 +55,9 @@ export function extractAuthToken(
     }
   }
 
-  if (process.env.MCP_AUTH_TOKEN) {
-    return process.env.MCP_AUTH_TOKEN;
+  const envToken = process.env.MCP_AUTH_TOKEN?.trim();
+  if (envToken) {
+    return envToken;
   }
 
   return undefined;
